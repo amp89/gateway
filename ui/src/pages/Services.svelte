@@ -3,7 +3,7 @@
   import Modal from '../lib/Modal.svelte';
 
   const blankSvc = () => ({ name: '', base_url: 'https://', auth_style: 'bearer', auth_name: '' });
-  const blankOp = () => ({ name: '', method: 'GET', path_template: '/', query_fields: '', body_fields: '', scope_fields: '', description: '', anyQuery: false, anyBody: false });
+  const blankOp = () => ({ name: '', method: 'GET', path_template: '/', query_fields: '', body_fields: '', scope_fields: '', required_fields: '', description: '', anyQuery: false, anyBody: false });
 
   let services = $state<any[]>([]), bundled = $state<any[]>([]), errors = $state<Record<string, string>>({});
   let selected = $state<any>(null), ops = $state<any[]>([]);       // service modal
@@ -57,14 +57,14 @@
   const list = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
   function editOp(o: any) {
     opForm = { id: o.id, f: { name: o.name, method: o.method, path_template: o.path_template, query_fields: (o.query_fields ?? []).join(', '),
-      body_fields: (o.body_fields ?? []).join(', '), scope_fields: o.scope_fields.join(', '), description: o.description,
+      body_fields: (o.body_fields ?? []).join(', '), scope_fields: o.scope_fields.join(', '), required_fields: (o.required_fields ?? []).join(', '), description: o.description,
       anyQuery: o.query_fields === null, anyBody: o.body_fields === null } };
   }
   function saveOp(e: Event) {
     e.preventDefault();
     if (!opForm) return;
     const { id, f } = opForm;
-    const body: any = { name: f.name, method: f.method, path_template: f.path_template, scope_fields: list(f.scope_fields), description: f.description,
+    const body: any = { name: f.name, method: f.method, path_template: f.path_template, scope_fields: list(f.scope_fields), required_fields: list(f.required_fields), description: f.description,
       query_fields: f.anyQuery ? null : list(f.query_fields), body_fields: f.anyBody ? null : list(f.body_fields) };
     run(async () => {
       if (id) await patch(`/operations/${id}`, { ...body, query_fields: body.query_fields ?? undefined, body_fields: body.body_fields ?? undefined,
@@ -218,7 +218,7 @@
       <tbody>
         {#each ops as o (o.id)}
           <tr><td>{o.name}{#if !o.enabled} <span class="pill">off</span>{/if}<div class="muted">{o.description}</div></td>
-            <td class="mono">{o.method} {o.path_template}</td><td>{fields(o.query_fields)}</td><td>{fields(o.body_fields)}</td><td>{o.scope_fields.join(', ') || '—'}</td>
+            <td class="mono">{o.method} {o.path_template}</td><td>{fields(o.query_fields)}</td><td>{fields(o.body_fields)}{#if o.required_fields?.length}<div class="muted">required: {o.required_fields.join(', ')}</div>{/if}</td><td>{o.scope_fields.join(', ') || '—'}</td>
             <td class="actions"><button onclick={() => { errors = {}; editOp(o); }}>Edit</button> <button class="danger" onclick={() => deleteOp(o)}>Delete</button></td></tr>
         {:else}<tr><td colspan="6" class="muted">No operations yet. Example: name <code>list_items</code>, method GET, path <code>/items</code>.</td></tr>{/each}
       </tbody>
@@ -250,6 +250,9 @@
       </div>
       <div class="row">
         <label><span>Scope fields (path/query/body names)</span><input bind:value={opForm.f.scope_fields} /></label>
+        <label><span>Required fields (calls without them are refused)</span><input bind:value={opForm.f.required_fields} /></label>
+      </div>
+      <div class="row">
         <label><span>Description</span><input bind:value={opForm.f.description} maxlength="200" /></label>
       </div>
       {#if errors.op}<p class="error">{errors.op}</p>{/if}

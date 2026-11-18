@@ -181,7 +181,8 @@ def test_bad_path_value_not_accepted(env, upstream):
     kid = next(k["id"] for k in env.get(f"{ADMIN}/keys").json()["keys"] if k["name"] == "closer")
     rule(env, "close", "todoist.task_close", {"path": {"task_id": "{text}"}}, key_id=kid)
     deliver(env, upstream, update(1, 111, "/close ../../x y"))
-    assert todoist_calls(upstream) == [] and sent(upstream) == [{"chat_id": 111, "text": "not accepted"}]
+    assert todoist_calls(upstream) == []
+    assert sent(upstream) == [{"chat_id": 111, "text": "not accepted: invalid path param 'task_id'"}]
 
 
 def test_rate_limited(make_client, upstream):

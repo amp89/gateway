@@ -85,7 +85,10 @@
       "scope_fields": [
         "project_id"
       ],
-      "description": "Create a task"
+      "description": "Create a task",
+      "required_fields": [
+        "content"
+      ]
     },
     {
       "name": "quick_add",
@@ -96,7 +99,10 @@
         "text"
       ],
       "scope_fields": [],
-      "description": "Natural-language add: dates, #project, @label parsed by Todoist"
+      "description": "Natural-language add: dates, #project, @label parsed by Todoist",
+      "required_fields": [
+        "text"
+      ]
     },
     {
       "name": "task_close",

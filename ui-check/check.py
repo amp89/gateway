@@ -3,6 +3,7 @@
 Fails on: a raw error code on screen, an unexpected error message, a browser console error, a missing element.
 Screenshots of every page land in $OUT.
 """
+import json
 import os
 import re
 import subprocess
@@ -404,7 +405,8 @@ def main() -> None:
         dlg = page.get_by_role("dialog", name="Edit /todo")
         dlg.get_by_label(re.compile("^Call template")).fill("{nope")
         dlg.get_by_role("button", name="Save").click()
-        expect(dlg.locator(".error")).to_contain_text("not valid JSON")
+        expect(dlg.locator(".error").first).to_contain_text("Won't run: key lacks this permission")
+        expect(dlg.locator(".error").last).to_contain_text("not valid JSON")
         dlg.get_by_label(re.compile("^Call template")).fill('{"body": {"text": "{text} #Home"}}')
         dlg.get_by_label(re.compile("^Reply template")).fill("added {body.content}")
         dlg.get_by_role("button", name="Save").click()
@@ -413,6 +415,45 @@ def main() -> None:
         shot(page, "commands")
         no_raw_codes(page)
         row.get_by_role("button", name="Delete").click()  # confirm() is accepted by the page-wide handler
+        expect(page.get_by_text("No commands yet.")).to_be_visible()
+
+        step("commands: a call that can't work is refused with the reason, dry run, then saved")
+        go(page, "commands")
+        page.get_by_role("button", name="Add command").click()
+        dlg = page.get_by_role("dialog", name="Add command")
+        dlg.get_by_label(re.compile("^Bot")).select_option(label="alerts")
+        dlg.get_by_label("Command (a-z, 0-9, _)").fill("ass")
+        dlg.get_by_label("Operation").select_option("kanbanflow.tasks_add")
+        dlg.get_by_label("Run as key").select_option(label="uicheck")
+        fields = dlg.get_by_test_id("op-fields")
+        expect(fields).to_contain_text("name*")
+        expect(fields).to_contain_text("columnId*")
+        expect(fields).to_contain_text("(limitable)")
+        tpl = dlg.get_by_label(re.compile("^Call template"))
+        assert json.loads(tpl.input_value()) == {"path": {}, "query": {}, "body": {"name": "{text}", "columnId": ""}}
+        dlg.get_by_role("button", name="Save").click()
+        expect(dlg.locator(".error")).to_contain_text("missing required field 'columnId'")
+        tpl.fill('{"path": {}, "query": {}, "body": {"text": "{text}"}}')  # the template that used to save fine
+        dlg.get_by_role("button", name=re.compile("^Dry run")).click()
+        expect(dlg.get_by_test_id("dry-error")).to_contain_text("undeclared body fields ['text']")
+        dlg.get_by_role("button", name="Save").click()
+        expect(dlg.locator(".error").last).to_contain_text("undeclared body fields ['text']")
+        dlg.get_by_role("button", name="Fill template").click()
+        tpl.fill(tpl.input_value().replace('"columnId": ""', '"columnId": "col1"'))
+        dlg.get_by_label("Try with text").fill("buy milk")
+        dlg.get_by_role("button", name=re.compile("^Dry run")).click()
+        dry = dlg.get_by_test_id("dry-result")
+        expect(dry).to_contain_text("POST https://kanbanflow.com/api/v1/tasks")
+        expect(dry).to_contain_text('"name": "buy milk"')
+        expect(dry).to_contain_text("key lacks this permission")
+        shot(page, "commands-dry-run")
+        dlg.get_by_role("button", name="Save").click()
+        expect(dlg).to_have_count(0)
+        expect(page.locator(".error").first).to_contain_text("saved, but it won't run yet")
+        row = page.locator("tr", has_text="/ass")
+        expect(row).to_contain_text("kanbanflow.tasks_add")
+        no_raw_codes(page)
+        row.get_by_role("button", name="Delete").click()
         expect(page.get_by_text("No commands yet.")).to_be_visible()
 
         step("settings: cleanup run now")

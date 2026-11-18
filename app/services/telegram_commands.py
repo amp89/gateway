@@ -12,10 +12,10 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, ValidationError
 
-from ..access import _resource_str, run_checked
+from ..access import _resource_str, read_scope, run_checked
 from ..admin_auth import ApiError, require_admin
 from ..errors import err
-from .generic import PLACEHOLDER, CallBody, prepare_call, verr
+from .generic import PLACEHOLDER, CallBody, CallError, check_call, op_def, prepare_call, scope_resources, verr
 from .telegram import tg_call
 
 log = logging.getLogger("gateway.telegram.commands")
@@ -27,6 +27,8 @@ MAX_REPLY = 4096
 ERRORS = {400: "not accepted", 401: "not allowed", 403: "not allowed", 429: "too many requests",
           502: "upstream error", 504: "upstream timeout"}
 NEEDS_TEXT = "needs text after the command"
+SAMPLE = "sample"  # stands in for the message text when a template is checked ahead of time
+LAST_ERROR_MAX = 300
 
 
 # -- parsing and templates ------------------------------------------------------------------
@@ -120,6 +122,10 @@ class CommandIn(BaseModel):
     enabled: bool = True
 
 
+class DryRun(CommandIn):
+    text: str = Field(default=SAMPLE, max_length=4096)
+
+
 class CommandPatch(BaseModel):
     bot_id: int | None = None
     command: str | None = Field(default=None, pattern=CMD_NAME)
@@ -157,6 +163,7 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             return
         tpl = gw.vault.dec(rule["reply_enc"]) if rule["reply_enc"] else ""
         service, operation = rule["action"].split(".", 1)
+        failure = None
         try:
             body = CallBody(**fill(call, text))
             resources, handler = prepare_call(gw, service, operation, body)
@@ -165,11 +172,29 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             result = await run_checked(gw, lambda: gw.access.caller_by_id(rule["key_id"]), rule["action"],
                                        resources, handler, "telegram", f"{where} {extra}".strip())
             out = reply_text(tpl, result)
+        except CallError as e:  # names fields only: safe to tell the sender why
+            failure = f"not accepted: {e.extra.get('detail', '')}"
+            out = failure
         except ApiError as e:
             out = ERRORS.get(e.status, "failed")
-        except ValidationError:
+            failure = f"{out} ({e.status} {e.code})" + (f": {e.extra['detail']}" if e.extra.get("detail") else "")
+        except ValidationError as e:
             out = ERRORS[400]
+            failure = f"not accepted: {verr(e)}"
+        record(rule, failure)
         await send(bot, m["chat_id"], out)
+
+    def record(rule, failure: str | None) -> None:
+        """Keep the last failure (encrypted: it can quote upstream text) so the Commands page can say why."""
+        if failure is None and rule["last_error_enc"] is None:
+            return
+        with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+            if failure is None:
+                conn.execute("UPDATE commands SET last_error_enc = NULL, last_error_at = NULL WHERE id = ?",
+                             (rule["id"],))
+            else:
+                conn.execute("UPDATE commands SET last_error_enc = ?, last_error_at = ? WHERE id = ?",
+                             (gw.vault.enc(failure[:LAST_ERROR_MAX]), gw.clock.now(), rule["id"]))
 
     async def on_inbound(bot_id: int, msgs: list[dict]) -> None:
         for m in msgs:  # in order, one at a time
@@ -181,53 +206,106 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
     gw.inbound_hooks.append(on_inbound)
 
     # -- admin ---------------------------------------------------------------------------------
-    def problem(row) -> str:
+    def operation(action: str):
+        """(service row, operation dict) for 'service.operation', or None."""
+        m = ACTION.match(action)
+        if m is None:
+            return None
+        svc = conn.execute("SELECT * FROM services WHERE name = ?", (m.group(1),)).fetchone()
+        row = None if svc is None else conn.execute(
+            "SELECT * FROM operations WHERE service_id = ? AND name = ?", (svc["id"], m.group(2))).fetchone()
+        return None if row is None else (svc, op_def(row))
+
+    def fits(op: dict, call: dict, text: str = SAMPLE) -> str:
+        """'' if the call template, filled with text, passes every check the relay makes; else the reason."""
+        try:
+            check_call(op, CallBody(**fill(call, text)))
+        except CallError as e:
+            return e.extra.get("detail", "invalid")
+        except ValidationError as e:
+            return verr(e)
+        return ""
+
+    def grant_check(key_id: int, action: str, op: dict, call: dict) -> tuple[str, str]:
+        """(problem, note) for the key's grant on action against the template. Same rules as Access.check;
+        a scope value taken from the message text can only be checked when the command runs (note)."""
+        key = conn.execute("SELECT name FROM gateway_keys WHERE id = ?", (key_id,)).fetchone()
+        perm = conn.execute("SELECT scope_json, scope_enc FROM permissions WHERE key_id = ? AND action = ?",
+                            (key_id, action)).fetchone()
+        if key is None or perm is None:
+            return "key lacks this permission (tick it on Permissions)", ""
+        scope = read_scope(gw, perm)
+        if not scope:
+            return "", ""
+        try:
+            res = scope_resources(op, CallBody(**call))
+        except ValidationError:
+            return "", ""
+        notes = []
+        for f, allowed in scope.items():
+            v = res.get(f)
+            if v is None or v == []:
+                return f"key '{key['name']}' is limited by {f}: set {f} in the call template", ""
+            vals = v if isinstance(v, list) else [v]
+            if any(uses_text(x) for x in vals):
+                notes.append(f"{f} comes from the message text: values outside what key '{key['name']}' "
+                             "may use are refused when the command runs")
+            elif any(str(x) not in {str(a) for a in allowed} for x in vals):
+                return f"{f} is outside what key '{key['name']}' may use (see Permissions)", ""
+        return "", "; ".join(notes)
+
+    def status(row) -> tuple[str, str]:
+        """(problem, note) for a stored command: anything that would make it fail when it runs."""
         key = conn.execute("SELECT status FROM gateway_keys WHERE id = ?", (row["key_id"],)).fetchone()
         if key is None or key["status"] != "active":
-            return f"key {key['status'] if key else 'missing'}"
-        if gw.access.registry.get(row["action"]) is None:
-            return "action missing or disabled"
-        if conn.execute("SELECT 1 FROM permissions WHERE key_id = ? AND action = ?",
-                        (row["key_id"], row["action"])).fetchone() is None:
-            return "key lacks this permission (tick it on Permissions)"
-        return ""
+            return f"key {key['status'] if key else 'missing'}", ""
+        found = operation(row["action"])
+        if gw.access.registry.get(row["action"]) is None or found is None:
+            return "action missing or disabled", ""
+        call = gw.vault.dec_json(row["call_enc"])
+        why = fits(found[1], call)
+        if why:
+            return f"call template no longer fits {row['action']}: {why}", ""
+        return grant_check(row["key_id"], row["action"], found[1], call)
 
     def out(row) -> dict:
         bot = conn.execute("SELECT name FROM bots WHERE id = ?", (row["bot_id"],)).fetchone()
         key = conn.execute("SELECT name FROM gateway_keys WHERE id = ?", (row["key_id"],)).fetchone()
+        problem, note = status(row)
         return {"id": row["id"], "bot_id": row["bot_id"], "bot": bot["name"] if bot else "",
                 "command": row["command"], "key_id": row["key_id"], "key": key["name"] if key else "",
                 "action": row["action"], "call": gw.vault.dec_json(row["call_enc"]),
                 "reply": gw.vault.dec(row["reply_enc"]) if row["reply_enc"] else "",
-                "enabled": bool(row["enabled"]), "created_at": row["created_at"], "problem": problem(row)}
+                "enabled": bool(row["enabled"]), "created_at": row["created_at"], "problem": problem, "note": note,
+                "last_error": gw.vault.dec(row["last_error_enc"]) if row["last_error_enc"] else "",
+                "last_error_at": row["last_error_at"]}
 
     def bad(detail: str) -> ApiError:
         return ApiError(400, "bad_request", detail=detail)
 
-    def check(c: CommandIn) -> dict:
-        """Refs exist, action is a declared service operation, call fits it. Returns the normalized call."""
+    def check(c: CommandIn) -> tuple[dict, tuple]:
+        """Refs exist, action is a declared service operation, and the call passes every check the relay
+        makes (with sample text for {text}), so a saved command can't be refused for its shape when it runs.
+        Returns the normalized call and (service row, operation)."""
         if conn.execute("SELECT 1 FROM bots WHERE id = ?", (c.bot_id,)).fetchone() is None:
             raise bad("unknown bot")
         key = conn.execute("SELECT status FROM gateway_keys WHERE id = ?", (c.key_id,)).fetchone()
         if key is None or key["status"] == "revoked":
             raise bad("unknown or revoked key")
-        m = ACTION.match(c.action)
-        op = None if m is None else conn.execute(
-            "SELECT o.path_template FROM operations o JOIN services s ON s.id = o.service_id"
-            " WHERE s.name = ? AND o.name = ?", (m.group(1), m.group(2))).fetchone()
-        if op is None:
+        found = operation(c.action)
+        if found is None:
             raise bad("action must be a service operation (service.operation)")
         extra = set(c.call) - {"path", "query", "body"}
         if extra:
             raise bad(f"call template: unknown parts {sorted(extra)}; use path, query, body")
         try:
-            call = CallBody(**c.call)
+            call = CallBody(**c.call).model_dump()
         except ValidationError as e:
             raise bad("call template: " + verr(e)) from None
-        names = set(PLACEHOLDER.findall(op["path_template"]))
-        if set(call.path) != names:
-            raise bad(f"call template: path params must be exactly {sorted(names)}")
-        return call.model_dump()
+        why = fits(found[1], call)
+        if why:
+            raise bad(f"call template: {why}")
+        return call, found
 
     def rule_or_404(cmd_id: int):
         row = conn.execute("SELECT * FROM commands WHERE id = ?", (cmd_id,)).fetchone()
@@ -242,7 +320,7 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
 
     @admin.post("/commands", dependencies=auth)
     def create_command(body: CommandIn):
-        call = check(body)
+        call, _ = check(body)
         try:
             with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
                 cur = conn.execute(
@@ -266,7 +344,7 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             new = CommandIn(**merged)
         except ValidationError as e:
             return err(400, "bad_request", detail=verr(e))
-        call = check(new)
+        call, _ = check(new)
         try:
             with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
                 conn.execute(
@@ -278,6 +356,30 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             return err(409, "name_taken")
         gw.audit_event("admin.command.update", "ok", f"bot_id={new.bot_id} command={new.command}")
         return out(rule_or_404(cmd_id))
+
+    @admin.post("/commands/dry-run", dependencies=auth)
+    def dry_run(body: DryRun):
+        """What the command would send for this text, without sending it."""
+        call, (svc, op) = check(body)
+        filled = fill(call, body.text)
+        why = fits(op, call, body.text)
+        if why:
+            raise bad(f"with this text: {why}")
+        c = CallBody(**filled)
+        problem, note = grant_check(body.key_id, body.action, op, call)
+        return {"method": op["method"], "url": svc["base_url"] + check_call(op, c),
+                "query": {k: v for k, v in c.query.items() if v is not None}, "body": c.body,
+                "problem": problem, "note": note}
+
+    @admin.get("/commands/operations", dependencies=auth)
+    def command_operations():
+        """Field lists per service operation, for the command editor's hints and template skeleton."""
+        rows = conn.execute("SELECT s.name AS svc, o.* FROM operations o JOIN services s ON s.id = o.service_id"
+                            " WHERE s.enabled = 1 AND o.enabled = 1 ORDER BY s.name, o.name").fetchall()
+        return {"operations": [
+            {k: v for k, v in op_def(r).items() if k not in ("id", "enabled")}
+            | {"action": f"{r['svc']}.{r['name']}", "path_fields": PLACEHOLDER.findall(r["path_template"])}
+            for r in rows]}
 
     @admin.delete("/commands/{cmd_id}", dependencies=auth)
     def delete_command(cmd_id: int):
