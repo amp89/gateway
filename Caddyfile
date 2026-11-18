@@ -8,12 +8,23 @@
 }
 
 :8080 {
-	@gateway path /{$API_PREFIX} /{$API_PREFIX}/* /{$ADMIN_PREFIX} /{$ADMIN_PREFIX}/*
-	handle @gateway {
+	@api path /{$API_PREFIX} /{$API_PREFIX}/*
+	@admin path /{$ADMIN_PREFIX} /{$ADMIN_PREFIX}/*
+	handle @api {
 		request_body {
 			max_size 1MB
 		}
 		reverse_proxy gateway:8000
+	}
+	handle @admin {
+		request_body {
+			max_size 1MB
+		}
+		# Cloudflare (which sets CF-Connecting-IP) carries only the client API; on the admin side the caller
+		# could send any value, so it never reaches the gateway.
+		reverse_proxy gateway:8000 {
+			header_up -CF-Connecting-IP
+		}
 	}
 	handle {
 		respond 404

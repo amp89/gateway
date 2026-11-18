@@ -58,6 +58,19 @@ def new_secret() -> str:
     return KEY_PREFIX + secrets.token_urlsafe(32)
 
 
+def read_scope(gw, row) -> dict | None:
+    """A permission row's scope: encrypted scope_enc, or plain scope_json on rows from before migration 0010."""
+    if row["scope_enc"]:
+        return gw.vault.dec_json(row["scope_enc"])
+    return json.loads(row["scope_json"]) if row["scope_json"] else None
+
+
+def write_scope(gw, perm_id: int, scope: dict | None) -> None:
+    """Store a scope encrypted (None = no limit). Caller holds the DB lock or a transaction."""
+    gw.conn.execute("UPDATE permissions SET scope_enc = ?, scope_json = NULL WHERE id = ?",
+                    (gw.vault.enc_json(scope) if scope else None, perm_id))
+
+
 class Access:
     def __init__(self, gw) -> None:
         self.gw = gw
@@ -94,8 +107,9 @@ class Access:
             raise ApiError(401, "unauthorized")
         self.gw.conn.execute("UPDATE gateway_keys SET last_used_at = ? WHERE id = ?", (self.gw.clock.now(), row["id"]))
         grants = {
-            r["action"]: (json.loads(r["scope_json"]) if r["scope_json"] else None)
-            for r in self.gw.conn.execute("SELECT action, scope_json FROM permissions WHERE key_id = ?", (row["id"],))
+            r["action"]: read_scope(self.gw, r)
+            for r in self.gw.conn.execute("SELECT action, scope_json, scope_enc FROM permissions WHERE key_id = ?",
+                                          (row["id"],))
         }
         return Caller(row["id"], row["name"], grants)
 
@@ -186,4 +200,5 @@ async def run_checked(gw, get_caller, action: str, resources: dict, handler, cli
             action, status, audit_resource if audit_resource is not None else _resource_str(resources),
             key_id=caller.key_id if caller else None, key_name=caller.name if caller else "-",
             duration_ms=int((time.perf_counter() - started) * 1000), client_ip=client_ip,
+            throttle=None if caller else "unauthenticated",  # no valid key: anyone can cause these
         )

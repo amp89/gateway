@@ -10,7 +10,7 @@ else echo "container '$NAME' not running" >&2; exit 1; fi
 printf 'Gateway passphrase: '
 stty -echo 2>/dev/null || true
 trap 'stty echo 2>/dev/null || true' EXIT INT TERM
-read -r PASS
+IFS= read -r PASS
 stty echo 2>/dev/null || true
 echo
 printf '%s\n' "$PASS" | $E exec -i "$NAME" python -m app.unlock_cli

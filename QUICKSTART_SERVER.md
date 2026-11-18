@@ -45,6 +45,7 @@ ingress:
 ```
 - Only `/<API_PREFIX>/…` answers on `API_HOSTS`. The admin UI is unreachable through the tunnel.
 - `cloudflared tunnel run <name>` (or its systemd service).
+- Recommended: a Cloudflare rate-limiting rule on that hostname (e.g. 300 requests per minute per IP). The gateway limits each key, but calls without a valid key are only limited by what sits in front of it.
 
 ## 4. First run in the browser
 1. Open the setup link from the start script. The setup page asks for:

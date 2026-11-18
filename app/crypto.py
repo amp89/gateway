@@ -5,7 +5,7 @@ import hmac
 import json
 import secrets
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 VERIFY_CONSTANT = b"gateway-verify-v1"
 _MAXMEM = 512 * 1024 * 1024
@@ -46,19 +46,20 @@ class Vault:
     """Holds the Fernet key while unsealed. The key exists nowhere else."""
 
     def __init__(self) -> None:
-        self._f: Fernet | None = None
+        self._f: Fernet | MultiFernet | None = None
 
     @property
     def unsealed(self) -> bool:
         return self._f is not None
 
-    def unseal(self, f: Fernet) -> None:
+    def unseal(self, f: Fernet | MultiFernet) -> None:
+        """A MultiFernet encrypts with its first key and decrypts with any (used after a passphrase change)."""
         self._f = f
 
     def seal(self) -> None:
         self._f = None
 
-    def _key(self) -> Fernet:
+    def _key(self) -> Fernet | MultiFernet:
         if self._f is None:
             raise SealedError()
         return self._f
@@ -105,6 +106,7 @@ ENCRYPTED_COLUMNS: list[tuple[str, str, tuple[str, ...]]] = [
     ("messages", "id", ("sender_enc", "body_enc", "chat_id_enc")),
     ("audit", "id", ("resource_enc",)),
     ("commands", "id", ("call_enc", "reply_enc")),
+    ("permissions", "id", ("scope_enc",)),
 ]
 
 # Encrypted meta values (key -> Fernet token), re-encrypted on passphrase change.

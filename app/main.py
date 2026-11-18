@@ -2,10 +2,13 @@
 import asyncio
 import ipaddress
 import logging
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -15,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import db
 from .clock import Clock
 from .config import Settings
+from .crypto import SealedError
 from .errors import bare_404, err
 from .lockout import Lockout
 from .access import Access
@@ -29,6 +33,31 @@ UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inlin
 # httpx logs full request URLs at INFO; Telegram puts the bot token in the URL.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class AuditThrottle:
+    """At most `per_min` rows a minute per bucket for events anyone can cause without a key or a session
+    (unauthenticated API calls, locked-out logins, wrong setup codes). Dropped ones are counted and reported
+    on the next row of that bucket, so the log cannot be flooded and nothing disappears silently."""
+
+    def __init__(self, clock: Clock, per_min: int = 10) -> None:
+        self.clock, self.per_min = clock, per_min
+        self.buckets: dict[str, list] = {}  # name -> [window start, written, dropped]
+        self.lock = threading.Lock()
+
+    def allow(self, bucket: str) -> int | None:
+        """None = drop this row; else the number dropped since the last written one."""
+        now = self.clock.monotonic()
+        with self.lock:
+            b = self.buckets.setdefault(bucket, [now, 0, 0])
+            if now - b[0] >= 60:
+                b[0], b[1] = now, 0
+            if b[1] >= self.per_min:
+                b[2] += 1
+                return None
+            b[1] += 1
+            dropped, b[2] = b[2], 0
+            return dropped
 
 
 class Gateway:
@@ -46,7 +75,9 @@ class Gateway:
         self.bots_hooks: list = []  # callables run on the event loop when bot rows change
         self.inbound_hooks: list = []  # async callables(bot_id, stored messages) after a poll batch is stored
         self.setup_hooks: list = []  # callables(dev: bool) run right after first-run setup (vault open)
-        self.unlock_lockout = Lockout(clock)
+        self.unlock_lockout = Lockout(clock)  # web unlock and passphrase change
+        self.internal_unlock_lockout = Lockout(clock)  # unlock.sh: the web cannot lock the host shell out
+        self.audit_throttle = AuditThrottle(clock)
         self.seal = SealService(self)
         self.admin_auth = AdminAuth(self)
         self.access = Access(self)
@@ -76,21 +107,36 @@ class Gateway:
             self.loop.call_soon_threadsafe(hook)
 
     def audit_event(self, action: str, status: str, resource: str = "", *, key_id=None, key_name="-",
-                    duration_ms: int = 0, client_ip: str = "") -> None:
+                    duration_ms: int = 0, client_ip: str = "", throttle: str | None = None) -> None:
         """resource (bot names, chat IDs, project IDs, ...) is stored encrypted. While sealed only unlock/setup
-        attempts are audited; their resource ("admin", "unlock.sh") stays plain, marked by resource_enc = ''."""
-        if self.vault.unsealed:
-            plain, enc = "", (self.vault.enc(resource) if resource else "")
-        else:
-            plain, enc = resource, ""
-        self.conn.execute(
-            "INSERT INTO audit (ts, key_id, key_name, action, resource, resource_enc, status, duration_ms, client_ip)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (self.clock.now(), key_id, key_name, action, plain, enc, status, duration_ms, client_ip),
-        )
+        attempts are audited; their resource ("admin", "unlock.sh") stays plain, marked by resource_enc = ''.
+        throttle: bucket name for events anyone can trigger without credentials (see AuditThrottle)."""
+        if throttle is not None:
+            dropped = self.audit_throttle.allow(throttle)
+            if dropped is None:
+                return
+            if dropped:
+                resource = f"{resource} (+{dropped} similar not logged)".strip()
+        # Encrypt and write under the DB lock: a passphrase change swaps the key under the same lock, so a row
+        # can never be encrypted with the old key and written after the re-encryption.
+        with self.conn.lock:
+            if self.vault.unsealed:
+                plain, enc = "", (self.vault.enc(resource) if resource else "")
+            else:
+                plain, enc = resource, ""
+            self.conn.execute(
+                "INSERT INTO audit (ts, key_id, key_name, action, resource, resource_enc, status, duration_ms,"
+                " client_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.clock.now(), key_id, key_name, action, plain, enc, status, duration_ms, client_ip),
+            )
 
     def audit_resource(self, row) -> str:
-        return self.vault.dec(row["resource_enc"]) if row["resource_enc"] else row["resource"]
+        if not row["resource_enc"]:
+            return row["resource"]
+        try:
+            return self.vault.dec(row["resource_enc"])
+        except InvalidToken:  # e.g. written with a key that is gone: show the row anyway
+            return "(unreadable)"
 
     def backfill_encrypted(self) -> None:
         """Rows from before migration 0008 hold chat IDs / audit resources in plaintext: encrypt them (runs on
@@ -105,10 +151,15 @@ class Gateway:
             for r in aud:
                 c.execute("UPDATE audit SET resource_enc = ?, resource = '' WHERE id = ?",
                           (v.enc(r["resource"]) if r["resource"] else "", r["id"]))
-        if msgs or aud:
+            perms = c.execute("SELECT id, scope_json FROM permissions WHERE scope_json IS NOT NULL").fetchall()
+            for r in perms:  # from before migration 0010
+                c.execute("UPDATE permissions SET scope_enc = ?, scope_json = NULL WHERE id = ?",
+                          (v.enc(r["scope_json"]), r["id"]))
+        if msgs or aud or perms:
             self.conn.execute("VACUUM")
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # old page copies in the WAL file too
-            log.info("encrypted %d message chat IDs and %d audit resources from before the upgrade", len(msgs), len(aud))
+            log.info("encrypted %d message chat IDs, %d audit resources and %d permission scopes from before the"
+                     " upgrade", len(msgs), len(aud), len(perms))
 
     def client_ip(self, request: Request) -> str:
         peer = request.client.host if request.client else ""
@@ -116,14 +167,23 @@ class Gateway:
             trusted = any(ipaddress.ip_address(peer) in net for net in self._trusted)
         except ValueError:
             trusted = False
-        if trusted:
-            cf = request.headers.get("cf-connecting-ip", "").strip()
-            if cf:
-                return cf
-            xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            if xff:
-                return xff
-        return peer
+        if not trusted:
+            return peer
+        # CF-Connecting-IP is set by Cloudflare, which carries only the client API; on the admin side (Tailscale,
+        # localhost) the caller could send any value, so it is honoured for the API prefix only.
+        api = f"/{self.settings.api_prefix}"
+        path = request.url.path
+        fwd = ""
+        if path == api or path.startswith(api + "/"):
+            fwd = request.headers.get("cf-connecting-ip", "").strip()
+        if not fwd:
+            fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if not fwd:
+            return peer
+        try:
+            return str(ipaddress.ip_address(fwd))
+        except ValueError:  # not an address: never store caller-chosen text as the IP
+            return peer
 
 
 def default_modules() -> list:
@@ -220,6 +280,15 @@ def create_app(
     async def api_error(request, exc: ApiError):
         return err(exc.status, exc.code, **exc.extra)
 
+    @app.exception_handler(SealedError)
+    async def sealed_exc(request, exc):
+        return err(503, "sealed")
+
+    @app.exception_handler(InvalidToken)
+    async def invalid_token_exc(request, exc):
+        log.error("%s %s: stored value cannot be decrypted with the current key", request.method, request.url.path)
+        return err(500, "error")
+
     @app.exception_handler(RequestValidationError)
     async def validation_exc(request, exc):
         return err(400, "bad_request", detail=validation_detail(exc))
@@ -239,13 +308,21 @@ def create_app(
         if path == admin_root or path.startswith(admin_root + "/"):
             if _host(request) not in settings.admin_hosts:
                 return bare_404()
+            if request.method not in ("GET", "HEAD", "OPTIONS"):
+                # Login, unlock and setup have no CSRF token yet: refuse a browser request from another site.
+                origin = request.headers.get("origin")
+                if origin is not None and (urlsplit(origin).hostname or "") != _host(request):
+                    return err(403, "csrf")
             if path.startswith(admin_api + "/") and path not in seal_exempt and gw.seal.state() != "unsealed":
                 return err(503, "sealed")
             resp = await call_next(request)
+            resp.headers.setdefault("Content-Security-Policy", UI_CSP)
             resp.headers.setdefault("X-Content-Type-Options", "nosniff")
             resp.headers.setdefault("Referrer-Policy", "no-referrer")
             resp.headers.setdefault("X-Frame-Options", "DENY")
             resp.headers.setdefault("Cache-Control", "no-store")
+            if settings.production:
+                resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
             return resp
         return bare_404()
 

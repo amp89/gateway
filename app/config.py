@@ -1,9 +1,13 @@
 """Settings from the environment (see SPEC.md section 11)."""
+import logging
 import os
 import re
 from dataclasses import dataclass, replace
 
 _PREFIX = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ENVS = ("production", "development")
+_LOCAL = {"localhost", "127.0.0.1", "::1"}
+log = logging.getLogger("gateway.config")
 
 
 def _list(value: str) -> tuple[str, ...]:
@@ -23,6 +27,7 @@ class Settings:
     upstream_max_bytes: int = 1_048_576
     api_rate_per_min: int = 120
     session_idle_min: int = 60
+    session_max_hours: int = 12
     audit_retention_days: int = 90
     default_message_retention_days: int = 30
     dev_auto_unlock_passphrase: str = ""
@@ -62,7 +67,8 @@ class Settings:
             return e.get(name, "").strip() or default
 
         return cls(
-            env=g("ENV", d.env),
+            # unset ENV means production: a forgotten variable must not switch on dev behaviour
+            env=g("ENV", "production").lower(),
             api_prefix=g("API_PREFIX", d.api_prefix).strip("/"),
             admin_prefix=g("ADMIN_PREFIX", d.admin_prefix).strip("/"),
             api_hosts=_list(g("API_HOSTS", ",".join(d.api_hosts))),
@@ -73,6 +79,7 @@ class Settings:
             upstream_max_bytes=int(g("UPSTREAM_MAX_BYTES", d.upstream_max_bytes)),
             api_rate_per_min=int(g("API_RATE_PER_MIN", d.api_rate_per_min)),
             session_idle_min=int(g("SESSION_IDLE_MIN", d.session_idle_min)),
+            session_max_hours=int(g("SESSION_MAX_HOURS", d.session_max_hours)),
             audit_retention_days=int(g("AUDIT_RETENTION_DAYS", d.audit_retention_days)),
             default_message_retention_days=int(
                 g("DEFAULT_MESSAGE_RETENTION_DAYS", d.default_message_retention_days)
@@ -88,6 +95,8 @@ class Settings:
         )
 
     def validate(self) -> None:
+        if self.env not in ENVS:
+            raise RuntimeError(f"ENV must be one of {', '.join(ENVS)} (got {self.env!r})")
         for name, v in (("API_PREFIX", self.api_prefix), ("ADMIN_PREFIX", self.admin_prefix)):
             if not _PREFIX.fullmatch(v):
                 raise RuntimeError(f"{name} must be one path segment: letters, digits, - or _ (got {v!r})")
@@ -95,3 +104,11 @@ class Settings:
             raise RuntimeError("API_PREFIX and ADMIN_PREFIX must differ")
         if self.production and self.dev_auto_unlock_passphrase:
             raise RuntimeError("DEV_AUTO_UNLOCK_PASSPHRASE is forbidden when ENV=production")
+        if self.production:
+            for name, v, default in (("API_PREFIX", self.api_prefix, "api"), ("ADMIN_PREFIX", self.admin_prefix, "admin")):
+                if v == default:
+                    log.warning("%s is still the default %r: pick a hard-to-guess value in .env", name, v)
+            shared = (set(self.api_hosts) & set(self.admin_hosts)) - _LOCAL
+            if shared:
+                log.warning("API_HOSTS and ADMIN_HOSTS share %s: the admin UI is reachable wherever the API is",
+                            ", ".join(sorted(shared)))
