@@ -7,8 +7,11 @@ import secrets
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
+from cryptography.fernet import MultiFernet
+
 from . import crypto, db
 from .errors import bare_404, err
+from .lockout import Busy, Lockout
 
 log = logging.getLogger("gateway.seal")
 
@@ -67,29 +70,35 @@ class SealService:
             passphrase, db.meta_get(c, "kdf_salt"), db.meta_get(c, "kdf_params"), db.meta_get(c, "verify_token")
         )
 
-    def unlock(self, passphrase: str, via: str, client_ip: str = "") -> tuple[int, dict]:
-        """Returns (http status, body). Rate-limited; every attempt is audited."""
+    def unlock(self, passphrase: str, via: str, client_ip: str = "", lock: Lockout | None = None) -> tuple[int, dict]:
+        """Returns (http status, body). Rate-limited, one attempt at a time per counter; attempts are audited.
+        lock: the failure counter (default: the web one; unlock.sh has its own, so the web cannot block it)."""
         state = self.state()
         if state == "uninitialized":
             return 409, {"error": "uninitialized"}
         if state == "unsealed":
             return 200, {"state": "unsealed"}
-        lock = self.gw.unlock_lockout
-        wait = lock.retry_after()
-        if wait:
-            self.gw.audit_event("seal.unlock", "locked", via, client_ip=client_ip)
-            return 429, {"error": "locked", "retry_after": wait}
-        f = self.try_passphrase(passphrase)
-        if f is None:
-            lock.fail()
-            self.gw.audit_event("seal.unlock", "denied", via, client_ip=client_ip)
-            log.warning("unlock failed (%d consecutive)", lock.failures)
-            return 403, {"error": "wrong_passphrase", "retry_after": lock.retry_after()}
-        lock.success()
-        self._opened(f)
-        self.gw.audit_event("seal.unlock", "ok", via, client_ip=client_ip)
-        log.info("unsealed")
-        return 200, {"state": "unsealed"}
+        lock = lock or self.gw.unlock_lockout
+        try:
+            with lock.attempt():
+                wait = lock.retry_after()
+                if wait:
+                    self.gw.audit_event("seal.unlock", "locked", via, client_ip=client_ip, throttle="seal.unlock.locked")
+                    return 429, {"error": "locked", "retry_after": wait}
+                f = self.try_passphrase(passphrase)
+                if f is None:
+                    lock.fail()
+                    self.gw.audit_event("seal.unlock", "denied", via, client_ip=client_ip)
+                    log.warning("unlock failed (%d consecutive)", lock.failures)
+                    return 403, {"error": "wrong_passphrase", "retry_after": lock.retry_after()}
+                lock.success()
+                if not self.vault.unsealed:  # the other counter's attempt may have won meanwhile
+                    self._opened(f)
+                    self.gw.audit_event("seal.unlock", "ok", via, client_ip=client_ip)
+                    log.info("unsealed")
+                return 200, {"state": "unsealed"}
+        except Busy:
+            return 429, {"error": "busy", "retry_after": 1}
 
     def auto_unlock_dev(self) -> None:
         s = self.gw.settings
@@ -118,6 +127,21 @@ class SealService:
         f, meta = crypto.new_kdf(new, self.gw.settings.kdf_n)
         conn = self.gw.conn
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        previous = self.vault._f
+        try:
+            self._reencrypt(conn, tables, previous or old, f, meta)
+        except BaseException:
+            self.vault.unseal(previous)
+            raise
+        # old ciphertext must not linger in free pages or the WAL
+        try:
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:  # noqa: BLE001 - the change itself succeeded
+            log.exception("VACUUM after passphrase change failed")
+
+    def _reencrypt(self, conn, tables, old, f, meta) -> None:
+        """old: decrypts the current rows (the vault's key, which may still include an earlier one)."""
         with db.tx(conn) as c:
             for table, pk, cols in crypto.ENCRYPTED_COLUMNS:
                 if table not in tables:
@@ -135,7 +159,10 @@ class SealService:
                     db.meta_set(c, key, f.encrypt(old.decrypt(v.encode())).decode())
             for k, v in meta.items():
                 db.meta_set(c, k, v)
-        self.vault.unseal(f)
+            # Swap the key while still holding the DB lock: every encrypt-then-write runs under that lock, so
+            # nothing can be written with the old key after the rows above were re-encrypted. Reads already in
+            # flight may still hold old ciphertext: the old key stays usable for decrypting until restart.
+            self.vault.unseal(MultiFernet([f, old]))
 
     # -- private files in /run/gateway (tmpfs, readable only inside the container) ----------------
     @staticmethod
@@ -203,7 +230,7 @@ def internal_router(gw) -> APIRouter:
     def internal_unlock(request: Request, body: PassphraseBody):
         if not gw.seal.check_unlock_token(request.headers.get("x-unlock-token")):
             return bare_404()
-        status, payload = gw.seal.unlock(body.passphrase, "unlock.sh")
+        status, payload = gw.seal.unlock(body.passphrase, "unlock.sh", lock=gw.internal_unlock_lockout)
         return err(status, payload["error"], **{k: v for k, v in payload.items() if k != "error"}) if "error" in payload else payload
 
     return r
@@ -215,7 +242,7 @@ def admin_seal_routes(r: APIRouter, gw) -> None:
         if gw.seal.state() != "uninitialized":
             return err(409, "already_initialized")
         if not gw.seal.check_setup_code(body.setup_code):
-            gw.audit_event("seal.setup", "denied", "admin", client_ip=gw.client_ip(request))
+            gw.audit_event("seal.setup", "denied", "admin", client_ip=gw.client_ip(request), throttle="seal.setup.denied")
             return err(403, "wrong_setup_code")
         try:
             gw.seal.setup(body.passphrase, body.admin_password)

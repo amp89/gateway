@@ -27,6 +27,8 @@ services:
       - /tmp
       - /run/gateway
     cap_drop: [ALL]
+    mem_limit: 1g
+    pids_limit: 256
     security_opt: ["no-new-privileges:true"]
     environment:
       ENV: development

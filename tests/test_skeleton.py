@@ -62,7 +62,7 @@ def test_health_checks_kept_out_of_access_log():
 def test_api_url_from_env():
     prod = Settings.from_env({"ENV": "production", "API_PREFIX": "p1", "API_HOSTS": "GW.example.com, other.example"})
     assert prod.api_url == "https://gw.example.com/p1/v1"
-    dev = Settings.from_env({"API_HOSTS": "localhost", "GATEWAY_DEV_PORT": "39000"})
+    dev = Settings.from_env({"ENV": "development", "API_HOSTS": "localhost", "GATEWAY_DEV_PORT": "39000"})
     assert dev.api_url == "http://localhost:39000/api/v1"
 
 

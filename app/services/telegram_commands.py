@@ -90,12 +90,18 @@ def fields(tpl: str, data) -> str:
     return FIELD_REF.sub(lambda m: as_text(lookup(data, m.group(1))), tpl)
 
 
+# Loops and fields in one pass: text that came from the upstream is never scanned for {...} again.
+TOKEN = re.compile(LOOP.pattern + "|" + FIELD_REF.pattern, re.DOTALL)
+
+
 def render(tpl: str, data) -> str:
     """{a.b} = field; {#list}…{/list} = repeat for each item, with {field} / {.} relative to the item."""
-    def loop(m):
-        items = lookup(data, m.group(1))
-        return "".join(fields(m.group(2), it) for it in items) if isinstance(items, list) else ""
-    return fields(LOOP.sub(loop, tpl), data)
+    def one(m):
+        if m.group(1) is not None:
+            items = lookup(data, m.group(1))
+            return "".join(fields(m.group(2), it) for it in items) if isinstance(items, list) else ""
+        return as_text(lookup(data, m.group(3)))
+    return TOKEN.sub(one, tpl)
 
 
 def reply_text(tpl: str, result: dict) -> str:
@@ -238,11 +244,12 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
     def create_command(body: CommandIn):
         call = check(body)
         try:
-            cur = conn.execute(
-                "INSERT INTO commands (bot_id, command, key_id, action, call_enc, reply_enc, enabled, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (body.bot_id, body.command, body.key_id, body.action, gw.vault.enc_json(call),
-                 gw.vault.enc(body.reply) if body.reply else "", int(body.enabled), gw.clock.now()))
+            with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+                cur = conn.execute(
+                    "INSERT INTO commands (bot_id, command, key_id, action, call_enc, reply_enc, enabled, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (body.bot_id, body.command, body.key_id, body.action, gw.vault.enc_json(call),
+                     gw.vault.enc(body.reply) if body.reply else "", int(body.enabled), gw.clock.now()))
         except sqlite3.IntegrityError:
             return err(409, "name_taken")
         row = rule_or_404(cur.lastrowid)
@@ -261,11 +268,12 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             return err(400, "bad_request", detail=verr(e))
         call = check(new)
         try:
-            conn.execute(
-                "UPDATE commands SET bot_id = ?, command = ?, key_id = ?, action = ?, call_enc = ?, reply_enc = ?,"
-                " enabled = ? WHERE id = ?",
-                (new.bot_id, new.command, new.key_id, new.action, gw.vault.enc_json(call),
-                 gw.vault.enc(new.reply) if new.reply else "", int(new.enabled), cmd_id))
+            with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+                conn.execute(
+                    "UPDATE commands SET bot_id = ?, command = ?, key_id = ?, action = ?, call_enc = ?,"
+                    " reply_enc = ?, enabled = ? WHERE id = ?",
+                    (new.bot_id, new.command, new.key_id, new.action, gw.vault.enc_json(call),
+                     gw.vault.enc(new.reply) if new.reply else "", int(new.enabled), cmd_id))
         except sqlite3.IntegrityError:
             return err(409, "name_taken")
         gw.audit_event("admin.command.update", "ok", f"bot_id={new.bot_id} command={new.command}")

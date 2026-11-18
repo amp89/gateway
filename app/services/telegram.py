@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from .. import db
-from ..access import Action, run_action
+from ..access import Action, read_scope, run_action, write_scope
 from ..admin_auth import ApiError, require_admin
 from ..errors import err
 
@@ -105,6 +105,23 @@ class SendBody(BaseModel):
     silent: bool = False
 
 
+_PLAIN_TOKEN = object()  # placeholder in patch_bot's argument list for the token, encrypted at write time
+
+
+def rename_in_scopes(gw, c, old: str, new: str | None) -> None:
+    """Follow a bot rename (new) or deletion (None) in telegram.* scopes, inside the caller's transaction.
+    A grant whose bot list ends up empty is deleted: an empty scope would mean "no limit"."""
+    for p in c.execute("SELECT id, scope_json, scope_enc FROM permissions WHERE action LIKE 'telegram.%'").fetchall():
+        scope = read_scope(gw, p)
+        if not scope or old not in scope.get("bots", []):
+            continue
+        bots = [b for b in scope["bots"] if b != old] + ([new] if new and new not in scope["bots"] else [])
+        if bots:
+            write_scope(gw, p["id"], scope | {"bots": bots})
+        else:
+            c.execute("DELETE FROM permissions WHERE id = ?", (p["id"],))
+
+
 def _check_token(t: str) -> str:
     t = t.strip()
     if not TOKEN_RE.match(t):
@@ -165,12 +182,13 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
         tok = _check_token(body.token)
         retention = gw.settings.default_message_retention_days if body.retention_days is None else body.retention_days
         try:
-            cur = conn.execute(
-                "INSERT INTO bots (name, token_enc, allowlist_enc, polling_enabled, retention_days, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (body.name, gw.vault.enc(tok), gw.vault.enc_json([]), int(body.polling_enabled), retention,
-                 gw.clock.now()),
-            )
+            with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+                cur = conn.execute(
+                    "INSERT INTO bots (name, token_enc, allowlist_enc, polling_enabled, retention_days, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (body.name, gw.vault.enc(tok), gw.vault.enc_json([]), int(body.polling_enabled), retention,
+                     gw.clock.now()),
+                )
         except sqlite3.IntegrityError:
             return err(409, "name_taken")
         gw.audit_event("admin.bot.create", "ok", f"bot={body.name}")
@@ -180,11 +198,12 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
     @admin.patch("/bots/{bot_id}", dependencies=auth)
     def patch_bot(bot_id: int, body: BotPatch):
         row = bot_or_404(bot_id)
+        tok = _check_token(body.token) if body.token is not None else None
         sets, args = [], []
         if body.name is not None:
             sets.append("name = ?"); args.append(body.name)
-        if body.token is not None:
-            sets.append("token_enc = ?"); args.append(gw.vault.enc(_check_token(body.token)))
+        if tok is not None:
+            sets.append("token_enc = ?"); args.append(_PLAIN_TOKEN)  # encrypted below, under the DB lock
             sets.append("poll_error = ''")
         if body.polling_enabled is not None:
             sets.append("polling_enabled = ?"); args.append(int(body.polling_enabled))
@@ -194,7 +213,11 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
             sets.append("retention_days = ?"); args.append(body.retention_days)
         if sets:
             try:
-                conn.execute(f"UPDATE bots SET {', '.join(sets)} WHERE id = ?", (*args, bot_id))
+                with db.tx(conn) as c:  # encrypt + write atomically w.r.t. a passphrase change
+                    args = [gw.vault.enc(tok) if a is _PLAIN_TOKEN else a for a in args]
+                    c.execute(f"UPDATE bots SET {', '.join(sets)} WHERE id = ?", (*args, bot_id))
+                    if body.name is not None and body.name != row["name"]:
+                        rename_in_scopes(gw, c, row["name"], body.name)
             except sqlite3.IntegrityError:
                 return err(409, "name_taken")
         gw.audit_event("admin.bot.update", "ok", f"bot={row['name']}")
@@ -204,7 +227,9 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
     @admin.delete("/bots/{bot_id}", dependencies=auth)
     def delete_bot(bot_id: int):
         row = bot_or_404(bot_id)
-        conn.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+        with db.tx(conn) as c:
+            c.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+            rename_in_scopes(gw, c, row["name"], None)
         gw.audit_event("admin.bot.delete", "ok", f"bot={row['name']}")
         gw.bots_changed()
         return {"ok": True}
@@ -221,7 +246,8 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
         unknown = [i for i in ids if i not in known]
         if unknown:
             return err(400, "unknown_user", user_ids=unknown)
-        conn.execute("UPDATE bots SET allowlist_enc = ? WHERE id = ?", (gw.vault.enc_json(ids), bot_id))
+        with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+            conn.execute("UPDATE bots SET allowlist_enc = ? WHERE id = ?", (gw.vault.enc_json(ids), bot_id))
         gw.audit_event("admin.bot.allowlist", "ok", f"bot={row['name']} count={len(ids)}")
         return {"user_ids": ids}
 

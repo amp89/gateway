@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .. import db
-from ..access import Action, run_action
+from ..access import Action, read_scope, run_action
 from ..admin_auth import ApiError, require_admin
 from ..errors import err
 
@@ -28,6 +28,10 @@ PATH_VALUE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 QUERY_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 RESERVED = {"telegram", "admin", "gateway"}
+# Headers the relay or HTTP itself controls; a credential header must not replace them.
+RESERVED_HEADERS = {"host", "content-length", "content-type", "transfer-encoding", "connection", "accept"}
+# Text that ends up in generated client code (comments, docstrings): one line, no control characters.
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 DETAIL_MAX = 2048
 PACK_FILE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 DEMO_KEY = "dev-demo"
@@ -88,6 +92,8 @@ class ServiceIn(BaseModel):
             self.auth_name = ""
         elif not (HEADER_NAME if self.auth_style == "header" else QUERY_NAME).match(self.auth_name):
             raise ValueError("auth_name required for header/query auth (header: letters, digits, -)")
+        elif self.auth_style == "header" and self.auth_name.lower() in RESERVED_HEADERS:
+            raise ValueError(f"auth_name: {self.auth_name!r} is a reserved header")
         return self
 
 
@@ -114,6 +120,13 @@ class OperationIn(BaseModel):
     def _path(cls, v):
         return check_path_template(v)
 
+    @field_validator("description")
+    @classmethod
+    def _desc(cls, v):
+        if CONTROL.search(v):
+            raise ValueError("description: no line breaks or control characters")
+        return v
+
     @model_validator(mode="after")
     def _fields(self):
         for lst in (self.query_fields or [], self.body_fields or [], self.scope_fields):
@@ -122,11 +135,14 @@ class OperationIn(BaseModel):
                     raise ValueError(f"bad field name {f!r}")
         if self.method == "GET" and self.body_fields:
             raise ValueError("GET operations take no body")
-        known = set(PLACEHOLDER.findall(self.path_template))
-        known |= set(self.query_fields or []) | set(self.body_fields or [])
+        sources = [set(PLACEHOLDER.findall(self.path_template)), set(self.query_fields or []),
+                   set(self.body_fields or [])]
+        known = set().union(*sources)
         for f in self.scope_fields:
             if f not in known:
                 raise ValueError(f"scope field {f!r} must be a path placeholder or a declared query/body field")
+            if sum(f in s for s in sources) > 1:
+                raise ValueError(f"scope field {f!r} is declared in more than one of path, query, body")
         return self
 
 
@@ -207,6 +223,17 @@ def _redact(text: str, secret: str) -> str:
     return text
 
 
+def _redact_json(v, secret: str):
+    """_redact on every string (keys too) of parsed JSON: an upstream may echo the credential back."""
+    if isinstance(v, str):
+        return _redact(v, secret)
+    if isinstance(v, dict):
+        return {_redact(k, secret): _redact_json(x, secret) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_redact_json(x, secret) for x in v]
+    return v
+
+
 # -- the relay -----------------------------------------------------------------------------------
 async def relay(gw, svc, op: dict, call: CallBody):
     # path
@@ -279,7 +306,7 @@ async def relay(gw, svc, op: dict, call: CallBody):
             body = None
         elif "json" in ctype:
             try:
-                body = json.loads(raw)
+                body = _redact_json(json.loads(raw), cred)
             except ValueError:
                 body = _redact(text, cred)
         else:
@@ -299,12 +326,15 @@ def prepare_call(gw, service: str, operation: str, body: CallBody):
     resources: dict = {}
     op = op_def(op_row) if op_row is not None else None
     if op is not None:
+        # A scope field is checked wherever the caller put it: path, query and body are all relayed, so taking
+        # only the first copy would let a second, unchecked copy reach the upstream.
         src = [body.path, body.query, body.body if isinstance(body.body, dict) else {}]
         for f in op["scope_fields"]:
-            for s in src:
-                if f in s:
-                    resources[f] = s[f]
-                    break
+            found = [s[f] for s in src if f in s]
+            if len(found) == 1:
+                resources[f] = found[0]
+            elif found:
+                resources[f] = [x for v in found for x in (v if isinstance(v, list) else [v])]
 
     async def handler(caller):
         if op is None:  # unreachable: the permission check already refused the unknown action
@@ -469,8 +499,9 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
     @admin.put("/services/{service_id}/credential", dependencies=auth)
     def set_credential(service_id: int, body: CredentialBody):
         row = svc_or_404(service_id)
-        conn.execute("UPDATE services SET credential_enc = ?, updated_at = ? WHERE id = ?",
-                     (gw.vault.enc(body.credential.strip()), gw.clock.now(), service_id))
+        with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+            conn.execute("UPDATE services SET credential_enc = ?, updated_at = ? WHERE id = ?",
+                         (gw.vault.enc(body.credential.strip()), gw.clock.now(), service_id))
         gw.audit_event("admin.service.credential", "ok", f"service={row['name']}")
         return {"credential_set": True}
 
@@ -514,6 +545,15 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
         except ValidationError as e:
             return err(400, "bad_request", detail=verr(e))
         svc = svc_or_404(row["service_id"])
+        # A grant limited by a scope field that goes away would become unlimited: refuse instead.
+        limited = []
+        for p in conn.execute(
+                "SELECT k.name, p.scope_json, p.scope_enc FROM permissions p JOIN gateway_keys k ON k.id = p.key_id"
+                " WHERE p.action = ?", (f"{svc['name']}.{row['name']}",)).fetchall():
+            if set(read_scope(gw, p) or {}) - set(new.scope_fields):
+                limited.append(p["name"])
+        if limited:
+            return err(409, "scope_in_use", detail="limited by a removed scope field: " + ", ".join(sorted(limited)))
         try:
             with db.tx(conn) as c:
                 c.execute("DELETE FROM operations WHERE id = ?", (op_id,))
@@ -528,12 +568,6 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
                     for table in ("permissions", "commands"):
                         c.execute(f"UPDATE {table} SET action = ? WHERE action = ?",
                                   (f"{svc['name']}.{new.name}", f"{svc['name']}.{row['name']}"))
-                # scope fields that no longer exist would make grants unusable: drop them from scopes
-                for p in c.execute("SELECT id, scope_json FROM permissions WHERE action = ? AND scope_json IS NOT NULL",
-                                   (f"{svc['name']}.{new.name}",)).fetchall():
-                    sc = {k: v for k, v in json.loads(p["scope_json"]).items() if k in new.scope_fields}
-                    c.execute("UPDATE permissions SET scope_json = ? WHERE id = ?",
-                              (json.dumps(sc) if sc else None, p["id"]))
         except sqlite3.IntegrityError:
             return err(409, "name_taken")
         gw.audit_event("admin.operation.update", "ok", f"action={svc['name']}.{new.name}")

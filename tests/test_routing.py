@@ -54,8 +54,9 @@ def test_health_not_host_guarded(split):
     assert get(split, "/health", "anything").status_code == 200
 
 
-def _req(peer, headers):
-    return Request({"type": "http", "client": (peer, 1234), "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()]})
+def _req(peer, headers, path="/api/v1/me"):
+    return Request({"type": "http", "client": (peer, 1234), "path": path,
+                    "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()]})
 
 
 def test_client_ip_trusted_only_from_proxy(make_app):
@@ -64,3 +65,18 @@ def test_client_ip_trusted_only_from_proxy(make_app):
     assert gw.client_ip(_req("10.89.47.3", hdr)) == "203.0.113.9"
     assert gw.client_ip(_req("10.89.47.3", {"X-Forwarded-For": "198.51.100.1, 10.0.0.1"})) == "198.51.100.1"
     assert gw.client_ip(_req("192.0.2.50", hdr)) == "192.0.2.50"
+
+
+def test_client_ip_cf_header_only_for_the_api(make_app):
+    """Cloudflare carries only the client API: on admin paths CF-Connecting-IP is the caller's own text."""
+    gw = make_app(trusted_proxy_ips=("10.89.47.0/24",)).state.gw
+    hdr = {"CF-Connecting-IP": "203.0.113.9", "X-Forwarded-For": "100.84.12.7"}
+    assert gw.client_ip(_req("10.89.47.3", hdr, "/admin/api/login")) == "100.84.12.7"
+    assert gw.client_ip(_req("10.89.47.3", {"CF-Connecting-IP": "203.0.113.9"}, "/admin/api/login")) == "10.89.47.3"
+
+
+def test_client_ip_must_be_an_address(make_app):
+    gw = make_app(trusted_proxy_ips=("10.89.47.0/24",)).state.gw
+    assert gw.client_ip(_req("10.89.47.3", {"CF-Connecting-IP": "<script>x</script>"})) == "10.89.47.3"
+    assert gw.client_ip(_req("10.89.47.3", {"X-Forwarded-For": "not-an-ip, 1.2.3.4"})) == "10.89.47.3"
+    assert gw.client_ip(_req("10.89.47.3", {"X-Forwarded-For": "2001:db8::1"})) == "2001:db8::1"

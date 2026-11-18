@@ -1,22 +1,32 @@
 """Admin API: gateway keys, actions, permissions, audit (SPEC 8.1)."""
-import json
+import re
 import sqlite3
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from .access import read_scope, write_scope
 from .admin_auth import ApiError, require_admin
 from .errors import err
 
 
+def _no_control(v: str | None) -> str | None:
+    """Key names end up in generated client code (comments, docstrings): one line, no control characters."""
+    if v is not None and re.search(r"[\x00-\x1f\x7f]", v):
+        raise ValueError("name: no line breaks or control characters")
+    return v
+
+
 class KeyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
+    _name = field_validator("name")(_no_control)
 
 
 class KeyPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=64)
     status: Literal["active", "disabled"] | None = None
+    _name = field_validator("name")(_no_control)
 
 
 class Grant(BaseModel):
@@ -83,8 +93,8 @@ def admin_access_routes(r: APIRouter, gw) -> None:
     @r.get("/permissions", dependencies=auth)
     def list_permissions():
         grants = [
-            {"key_id": x["key_id"], "action": x["action"], "scope": json.loads(x["scope_json"]) if x["scope_json"] else None}
-            for x in conn.execute("SELECT key_id, action, scope_json FROM permissions ORDER BY key_id, action")
+            {"key_id": x["key_id"], "action": x["action"], "scope": read_scope(gw, x)}
+            for x in conn.execute("SELECT key_id, action, scope_json, scope_enc FROM permissions ORDER BY key_id, action")
         ]
         keys = [_key_row(x) for x in conn.execute("SELECT * FROM gateway_keys WHERE status != 'revoked' ORDER BY name")]
         return {"keys": keys, "actions": sorted(acc.registry.all()), "grants": grants}
@@ -95,11 +105,12 @@ def admin_access_routes(r: APIRouter, gw) -> None:
         if row["status"] == "revoked":
             return err(409, "revoked")
         scope = acc.validate_scope(action, body.scope)
-        conn.execute(
-            "INSERT INTO permissions (key_id, action, scope_json, created_at) VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(key_id, action) DO UPDATE SET scope_json = excluded.scope_json",
-            (key_id, action, json.dumps(scope) if scope else None, gw.clock.now()),
-        )
+        with conn.lock:  # encrypt + write atomically w.r.t. a passphrase change
+            conn.execute(
+                "INSERT INTO permissions (key_id, action, scope_json, created_at) VALUES (?, ?, NULL, ?)"
+                " ON CONFLICT(key_id, action) DO NOTHING", (key_id, action, gw.clock.now()))
+            perm = conn.execute("SELECT id FROM permissions WHERE key_id = ? AND action = ?", (key_id, action)).fetchone()
+            write_scope(gw, perm["id"], scope)
         gw.audit_event("admin.permission.set", "ok", f"key={row['name']} action={action}")
         return {"key_id": key_id, "action": action, "scope": scope}
 

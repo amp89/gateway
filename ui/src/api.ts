@@ -25,6 +25,8 @@ const MESSAGES: Record<string, string> = {
   upstream_error: 'The upstream API refused',
   upstream_timeout: 'The upstream API did not answer in time',
   sealed: 'The gateway is sealed; unlock it first',
+  scope_in_use: 'Keys are limited by a scope field you removed; remove those limits on Permissions first',
+  busy: 'Another attempt is running; try again in a moment',
 };
 
 function describe(status: number, body: any): string {

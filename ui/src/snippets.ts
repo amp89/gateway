@@ -43,6 +43,12 @@ export async function actionsFor(keyId: number): Promise<Act[]> {
   return out;
 }
 
+/** Admin-entered text (key names, descriptions) placed in comments and docstrings: one line only, so it can
+ * never start a new line of code in the generated file. */
+const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ');
+/** Same, safe inside a Python triple-quoted docstring. */
+const pyDoc = (s: string) => oneLine(s).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+
 const NO_BOT = 'No Telegram bot yet: add one on the admin Bots page, then pass its name.';
 const NO_USER = 'No Telegram user allowed on this bot yet: add one on the admin Bots page.';
 
@@ -103,7 +109,7 @@ function pyFunction(a: Act, names: Set<string>): string[] {
   else if (a.query === null) parts.push('query=query');
   if (b.length) parts.push(`body=given(${dictOf(b)})`);
   else if (a.body === null) parts.push('body=body');
-  const desc = a.desc ? `: ${a.desc.replaceAll('"""', "'''")}` : '';
+  const desc = a.desc ? `: ${pyDoc(a.desc)}` : '';
   return [
     `def ${fn}(${params.join(', ')}):`,
     `    """${a.svc}.${a.op}${desc} (${a.method} ${a.tpl} on the service). Only arguments you pass are sent."""`,
@@ -122,7 +128,7 @@ export function python(c: Ctx): string {
     ? fnNames.slice(0, 3).map((n) => `    python3 -c 'import gateway_client as g; print(g.${n}(...))'`)
     : ['    (no actions allowed yet: tick some for this key on the admin Permissions page)'];
   return [
-    `"""Gateway client for key "${c.key}". Python 3, standard library only. Copy to any machine and run.`,
+    `"""Gateway client for key "${pyDoc(c.key)}". Python 3, standard library only. Copy to any machine and run.`,
     '',
     'Save as gateway_client.py, then:',
     ...(c.secret ? [] : ['    export GATEWAY_KEY=gw_...']),
@@ -257,7 +263,7 @@ function shFunction(a: Act, names: Set<string>): string[] {
   }
   const data = fmt.length ? `"$(printf '{${fmt.join(', ')}}' ${vals.join(' ')})"` : `'{}'`;
   return [
-    `# ${a.svc}.${a.op}${a.desc ? `: ${a.desc}` : ''} (${a.method} ${a.tpl} on the service)`,
+    `# ${a.svc}.${a.op}${a.desc ? `: ${oneLine(a.desc)}` : ''} (${a.method} ${a.tpl} on the service)`,
     `#   ${[fn, ...usage].join(' ')}`,
     ...notes,
     `${fn}() {`,
@@ -276,7 +282,7 @@ export function shell(c: Ctx): string {
     : ': "${GATEWAY_KEY:?export GATEWAY_KEY=gw_... (the key\'s secret, shown once when it was created)}"';
   return [
     '#!/bin/sh',
-    `# Gateway client for key "${c.key}": sh + curl. Copy to any machine as gateway.sh.`,
+    `# Gateway client for key "${oneLine(c.key)}": sh + curl. Copy to any machine as gateway.sh.`,
     '#   sh gateway.sh                  -> who you are and what you may do',
     '#   sh gateway.sh FUNCTION ARGS... -> run one function below, e.g. sh gateway.sh send "hello"',
     `# Gateway URL: ${url} (override with GATEWAY_URL)`,
