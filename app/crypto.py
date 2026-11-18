@@ -105,7 +105,7 @@ ENCRYPTED_COLUMNS: list[tuple[str, str, tuple[str, ...]]] = [
     ("services", "id", ("credential_enc",)),
     ("messages", "id", ("sender_enc", "body_enc", "chat_id_enc")),
     ("audit", "id", ("resource_enc",)),
-    ("commands", "id", ("call_enc", "reply_enc")),
+    ("commands", "id", ("call_enc", "reply_enc", "last_error_enc")),
     ("permissions", "id", ("scope_enc",)),
 ]
 

@@ -107,7 +107,10 @@
       "scope_fields": [
         "project_id"
       ],
-      "description": "Create a task in a project"
+      "description": "Create a task in a project",
+      "required_fields": [
+        "title"
+      ]
     },
     {
       "name": "task_update",

@@ -112,6 +112,7 @@ class OperationIn(BaseModel):
     query_fields: list[str] | None = Field(default_factory=list)
     body_fields: list[str] | None = Field(default_factory=list)
     scope_fields: list[str] = Field(default_factory=list)
+    required_fields: list[str] = Field(default_factory=list)  # must be present (not null/"") in every call
     description: str = Field(default="", max_length=200)
     enabled: bool = True
 
@@ -129,7 +130,7 @@ class OperationIn(BaseModel):
 
     @model_validator(mode="after")
     def _fields(self):
-        for lst in (self.query_fields or [], self.body_fields or [], self.scope_fields):
+        for lst in (self.query_fields or [], self.body_fields or [], self.scope_fields, self.required_fields):
             for f in lst:
                 if not FIELD.match(f):
                     raise ValueError(f"bad field name {f!r}")
@@ -143,6 +144,11 @@ class OperationIn(BaseModel):
                 raise ValueError(f"scope field {f!r} must be a path placeholder or a declared query/body field")
             if sum(f in s for s in sources) > 1:
                 raise ValueError(f"scope field {f!r} is declared in more than one of path, query, body")
+        for f in self.required_fields:
+            if f not in known:
+                raise ValueError(f"required field {f!r} must be a path placeholder or a declared query/body field")
+        if len(self.required_fields) != len(set(self.required_fields)):
+            raise ValueError("required_fields: duplicate field")
         return self
 
 
@@ -153,6 +159,7 @@ class OperationPatch(BaseModel):
     query_fields: list[str] | None = None
     body_fields: list[str] | None = None
     scope_fields: list[str] | None = None
+    required_fields: list[str] | None = None
     description: str | None = None
     enabled: bool | None = None
     clear_query_fields: bool = False  # set query_fields to null (= any)
@@ -187,7 +194,9 @@ def op_def(row) -> dict:
         "id": row["id"], "name": row["name"], "method": row["method"], "path_template": row["path_template"],
         "query_fields": json.loads(row["query_fields_json"]) if row["query_fields_json"] is not None else None,
         "body_fields": json.loads(row["body_fields_json"]) if row["body_fields_json"] is not None else None,
-        "scope_fields": json.loads(row["scope_fields_json"]), "description": row["description"],
+        "scope_fields": json.loads(row["scope_fields_json"]),
+        "required_fields": json.loads(row["required_fields_json"]) if row["required_fields_json"] else [],
+        "description": row["description"],
         "enabled": bool(row["enabled"]),
     }
 
@@ -204,11 +213,12 @@ def svc_def(row, n_ops: int | None = None) -> dict:
 def insert_op(c, service_id: int, op: OperationIn) -> int:
     return c.execute(
         "INSERT INTO operations (service_id, name, method, path_template, query_fields_json, body_fields_json,"
-        " scope_fields_json, description, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " scope_fields_json, required_fields_json, description, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (service_id, op.name, op.method, op.path_template,
          None if op.query_fields is None else json.dumps(op.query_fields),
          None if op.body_fields is None else json.dumps(op.body_fields),
-         json.dumps(op.scope_fields), op.description, int(op.enabled)),
+         json.dumps(op.scope_fields), json.dumps(op.required_fields) if op.required_fields else None,
+         op.description, int(op.enabled)),
     ).lastrowid
 
 
@@ -234,36 +244,78 @@ def _redact_json(v, secret: str):
     return v
 
 
-# -- the relay -----------------------------------------------------------------------------------
-async def relay(gw, svc, op: dict, call: CallBody):
+# -- call checks (shared by the relay and the bot-command editor, so a saved command can't fail them later) --
+class CallError(ApiError):
+    """A call that doesn't fit its operation. The detail names fields only, never values: safe to show."""
+
+    def __init__(self, detail: str):
+        super().__init__(400, "bad_request", detail=detail)
+
+
+def _names(xs) -> str:
+    return ", ".join(sorted(xs)) or "none"
+
+
+def _missing(v) -> bool:
+    return v is None or v == "" or v == [] or v == {}
+
+
+def check_call(op: dict, call: CallBody) -> str:
+    """Every rule the relay applies before contacting the upstream. Returns the filled path."""
     # path
     names = PLACEHOLDER.findall(op["path_template"])
     if set(call.path) != set(names):
-        raise ApiError(400, "bad_request", detail=f"path params must be exactly {sorted(names)}")
+        raise CallError(f"path params must be exactly {sorted(names)}")
     path = op["path_template"]
     for n in names:
         v = str(call.path[n])
         if not PATH_VALUE.match(v) or v in (".", ".."):
-            raise ApiError(400, "bad_request", detail=f"invalid path param {n!r}")
+            raise CallError(f"invalid path param {n!r}")
         path = path.replace("{" + n + "}", v)
     # query
     if op["query_fields"] is not None:
         extra = set(call.query) - set(op["query_fields"])
         if extra:
-            raise ApiError(400, "bad_request", detail=f"undeclared query fields {sorted(extra)}")
+            raise CallError(f"undeclared query fields {sorted(extra)}; allowed: {_names(op['query_fields'])}")
     for k, v in call.query.items():
         if not (_scalar(v) or (isinstance(v, list) and all(_scalar(x) for x in v))):
-            raise ApiError(400, "bad_request", detail=f"query field {k!r} must be scalar or list")
+            raise CallError(f"query field {k!r} must be scalar or list")
     # body
     if call.body is not None:
         if op["method"] == "GET":
-            raise ApiError(400, "bad_request", detail="GET takes no body")
+            raise CallError("GET takes no body")
         if op["body_fields"] is not None:
             if not isinstance(call.body, dict):
-                raise ApiError(400, "bad_request", detail="body must be an object")
+                raise CallError("body must be an object")
             extra = set(call.body) - set(op["body_fields"])
             if extra:
-                raise ApiError(400, "bad_request", detail=f"undeclared body fields {sorted(extra)}")
+                raise CallError(f"undeclared body fields {sorted(extra)}; allowed: {_names(op['body_fields'])}")
+    # required
+    given = {**call.path, **call.query, **(call.body if isinstance(call.body, dict) else {})}
+    missing = [f for f in op.get("required_fields", []) if _missing(given.get(f))]
+    if missing:
+        raise CallError(f"missing required field{'s' if len(missing) > 1 else ''} {', '.join(map(repr, missing))}")
+    return path
+
+
+def scope_resources(op: dict, call: CallBody) -> dict:
+    """The values of the operation's scope fields in a call, as the permission check sees them.
+    A scope field is checked wherever the caller put it: path, query and body are all relayed, so taking
+    only the first copy would let a second, unchecked copy reach the upstream."""
+    resources: dict = {}
+    src = [call.path, call.query, call.body if isinstance(call.body, dict) else {}]
+    for f in op["scope_fields"]:
+        found = [s[f] for s in src if f in s]
+        if len(found) == 1:
+            resources[f] = found[0]
+        elif found:
+            resources[f] = [x for v in found for x in (v if isinstance(v, list) else [v])]
+    return resources
+
+
+# -- the relay -----------------------------------------------------------------------------------
+async def relay(gw, svc, op: dict, call: CallBody):
+    path = check_call(op, call)
     if svc["credential_enc"] is None:
         raise ApiError(502, "upstream_error", detail="service credential not set")
     cred = gw.vault.dec(svc["credential_enc"])
@@ -323,18 +375,8 @@ def prepare_call(gw, service: str, operation: str, body: CallBody):
     if svc is not None:
         op_row = gw.conn.execute("SELECT * FROM operations WHERE service_id = ? AND name = ? AND enabled = 1",
                                  (svc["id"], operation)).fetchone()
-    resources: dict = {}
     op = op_def(op_row) if op_row is not None else None
-    if op is not None:
-        # A scope field is checked wherever the caller put it: path, query and body are all relayed, so taking
-        # only the first copy would let a second, unchecked copy reach the upstream.
-        src = [body.path, body.query, body.body if isinstance(body.body, dict) else {}]
-        for f in op["scope_fields"]:
-            found = [s[f] for s in src if f in s]
-            if len(found) == 1:
-                resources[f] = found[0]
-            elif found:
-                resources[f] = [x for v in found for x in (v if isinstance(v, list) else [v])]
+    resources = scope_resources(op, body) if op is not None else {}
 
     async def handler(caller):
         if op is None:  # unreachable: the permission check already refused the unknown action
@@ -559,11 +601,13 @@ def setup(gw, client: APIRouter, admin: APIRouter) -> None:
                 c.execute("DELETE FROM operations WHERE id = ?", (op_id,))
                 c.execute(
                     "INSERT INTO operations (id, service_id, name, method, path_template, query_fields_json,"
-                    " body_fields_json, scope_fields_json, description, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " body_fields_json, scope_fields_json, required_fields_json, description, enabled)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (op_id, row["service_id"], new.name, new.method, new.path_template,
                      None if new.query_fields is None else json.dumps(new.query_fields),
                      None if new.body_fields is None else json.dumps(new.body_fields),
-                     json.dumps(new.scope_fields), new.description, int(new.enabled)))
+                     json.dumps(new.scope_fields), json.dumps(new.required_fields) if new.required_fields else None,
+                     new.description, int(new.enabled)))
                 if new.name != row["name"]:
                     for table in ("permissions", "commands"):
                         c.execute(f"UPDATE {table} SET action = ? WHERE action = ?",

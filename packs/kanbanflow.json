@@ -97,7 +97,11 @@
       "scope_fields": [
         "columnId"
       ],
-      "description": "Create a task (name, columnId required)"
+      "description": "Create a task (name, columnId required)",
+      "required_fields": [
+        "name",
+        "columnId"
+      ]
     },
     {
       "name": "task_update",
