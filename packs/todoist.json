@@ -1,0 +1,120 @@
+{
+  "service": {
+    "name": "todoist",
+    "base_url": "https://api.todoist.com/api/v1",
+    "auth_style": "bearer",
+    "auth_name": ""
+  },
+  "operations": [
+    {
+      "name": "projects_list",
+      "method": "GET",
+      "path_template": "/projects",
+      "query_fields": [
+        "cursor",
+        "limit"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "List projects (cursor paginated)"
+    },
+    {
+      "name": "labels_list",
+      "method": "GET",
+      "path_template": "/labels",
+      "query_fields": [
+        "cursor",
+        "limit"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "List personal labels (cursor paginated)"
+    },
+    {
+      "name": "tasks_list",
+      "method": "GET",
+      "path_template": "/tasks",
+      "query_fields": [
+        "project_id",
+        "section_id",
+        "label",
+        "cursor",
+        "limit"
+      ],
+      "body_fields": [],
+      "scope_fields": [
+        "project_id"
+      ],
+      "description": "List active tasks, optionally by project/section/label"
+    },
+    {
+      "name": "tasks_filter",
+      "method": "GET",
+      "path_template": "/tasks/filter",
+      "query_fields": [
+        "query",
+        "cursor",
+        "limit"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Tasks matching Todoist filter syntax, e.g. \"today | overdue\""
+    },
+    {
+      "name": "task_get",
+      "method": "GET",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "One task by ID"
+    },
+    {
+      "name": "tasks_add",
+      "method": "POST",
+      "path_template": "/tasks",
+      "query_fields": [],
+      "body_fields": [
+        "content",
+        "description",
+        "project_id",
+        "due_string",
+        "priority",
+        "labels"
+      ],
+      "scope_fields": [
+        "project_id"
+      ],
+      "description": "Create a task"
+    },
+    {
+      "name": "quick_add",
+      "method": "POST",
+      "path_template": "/tasks/quick",
+      "query_fields": [],
+      "body_fields": [
+        "text"
+      ],
+      "scope_fields": [],
+      "description": "Natural-language add: dates, #project, @label parsed by Todoist"
+    },
+    {
+      "name": "task_close",
+      "method": "POST",
+      "path_template": "/tasks/{task_id}/close",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Complete a task (cannot be project-scoped)"
+    },
+    {
+      "name": "task_delete",
+      "method": "DELETE",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Delete a task permanently"
+    }
+  ]
+}

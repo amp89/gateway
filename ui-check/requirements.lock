@@ -1,0 +1,9 @@
+# UI check only (podman-ui-check.sh). Hash-locked; install with --require-hashes --no-deps.
+greenlet==3.1.1 \
+    --hash=sha256:1443279c19fca463fc33e65ef2a935a5b09bb90f978beab37729e1c3c6c25fe9
+playwright==1.49.0 \
+    --hash=sha256:68d94beffb3c9213e3ceaafa66171affd9a5d9162e0c8a3eed1b1132c2e57598
+pyee==12.0.0 \
+    --hash=sha256:7b14b74320600049ccc7d0e0b1becd3b4bd0a03c745758225e31a59f4095c990
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

@@ -1,0 +1,147 @@
+{
+  "self_hosted": true,
+  "service": {
+    "name": "vikunja",
+    "base_url": "https://vikunja.example.com/api/v1",
+    "auth_style": "bearer",
+    "auth_name": ""
+  },
+  "operations": [
+    {
+      "name": "projects_list",
+      "method": "GET",
+      "path_template": "/projects",
+      "query_fields": [
+        "page",
+        "per_page",
+        "s",
+        "is_archived"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "List projects"
+    },
+    {
+      "name": "labels_list",
+      "method": "GET",
+      "path_template": "/labels",
+      "query_fields": [
+        "page",
+        "per_page",
+        "s"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "List labels"
+    },
+    {
+      "name": "tasks_list",
+      "method": "GET",
+      "path_template": "/tasks",
+      "query_fields": [
+        "page",
+        "per_page",
+        "s",
+        "sort_by",
+        "order_by",
+        "filter",
+        "filter_timezone",
+        "filter_include_nulls"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Tasks across all projects (filter, e.g. done = false && due_date < now+7d)"
+    },
+    {
+      "name": "project_tasks",
+      "method": "GET",
+      "path_template": "/projects/{project_id}/views/{view_id}/tasks",
+      "query_fields": [
+        "page",
+        "per_page",
+        "s",
+        "sort_by",
+        "order_by",
+        "filter",
+        "filter_timezone",
+        "filter_include_nulls",
+        "include_subprojects"
+      ],
+      "body_fields": [],
+      "scope_fields": [
+        "project_id"
+      ],
+      "description": "Tasks in one project view"
+    },
+    {
+      "name": "task_get",
+      "method": "GET",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [
+        "expand"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "One task"
+    },
+    {
+      "name": "tasks_add",
+      "method": "PUT",
+      "path_template": "/projects/{project_id}/tasks",
+      "query_fields": [],
+      "body_fields": [
+        "title",
+        "description",
+        "done",
+        "due_date",
+        "start_date",
+        "end_date",
+        "priority",
+        "hex_color",
+        "percent_done",
+        "repeat_after",
+        "repeat_mode",
+        "is_favorite",
+        "reminders"
+      ],
+      "scope_fields": [
+        "project_id"
+      ],
+      "description": "Create a task in a project"
+    },
+    {
+      "name": "task_update",
+      "method": "POST",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [
+        "title",
+        "description",
+        "done",
+        "due_date",
+        "start_date",
+        "end_date",
+        "priority",
+        "hex_color",
+        "percent_done",
+        "repeat_after",
+        "repeat_mode",
+        "is_favorite",
+        "reminders",
+        "project_id",
+        "bucket_id"
+      ],
+      "scope_fields": [],
+      "description": "Update a task (incl. done). Send the whole task (task_get first): fields left out may be cleared"
+    },
+    {
+      "name": "task_delete",
+      "method": "DELETE",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Delete a task"
+    }
+  ]
+}

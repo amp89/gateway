@@ -1,0 +1,139 @@
+{
+  "service": {
+    "name": "kanbanflow",
+    "base_url": "https://kanbanflow.com/api/v1",
+    "auth_style": "bearer",
+    "auth_name": ""
+  },
+  "operations": [
+    {
+      "name": "board_get",
+      "method": "GET",
+      "path_template": "/board",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Board: columns, swimlanes, colors (IDs for tasks_add)"
+    },
+    {
+      "name": "members_list",
+      "method": "GET",
+      "path_template": "/members",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Board members"
+    },
+    {
+      "name": "tasks_list",
+      "method": "GET",
+      "path_template": "/tasks",
+      "query_fields": [
+        "columnId",
+        "columnIndex",
+        "columnName",
+        "swimlaneId",
+        "startTaskId",
+        "startGroupingDate",
+        "limit",
+        "order"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Tasks per column (filter by column, paging with startTaskId)"
+    },
+    {
+      "name": "tasks_search",
+      "method": "GET",
+      "path_template": "/tasks/search",
+      "query_fields": [
+        "query",
+        "fields",
+        "columnId",
+        "swimlaneId",
+        "color",
+        "groupingDateFrom",
+        "groupingDateTo",
+        "limit"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Search tasks by text"
+    },
+    {
+      "name": "task_get",
+      "method": "GET",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [
+        "includePosition"
+      ],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "One task"
+    },
+    {
+      "name": "tasks_add",
+      "method": "POST",
+      "path_template": "/tasks",
+      "query_fields": [],
+      "body_fields": [
+        "name",
+        "columnId",
+        "swimlaneId",
+        "position",
+        "color",
+        "description",
+        "number",
+        "responsibleUserId",
+        "totalSecondsEstimate",
+        "pointsEstimate",
+        "groupingDate",
+        "dates",
+        "subTasks",
+        "labels",
+        "collaborators",
+        "timeline"
+      ],
+      "scope_fields": [
+        "columnId"
+      ],
+      "description": "Create a task (name, columnId required)"
+    },
+    {
+      "name": "task_update",
+      "method": "POST",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [
+        "name",
+        "columnId",
+        "swimlaneId",
+        "position",
+        "color",
+        "description",
+        "number",
+        "responsibleUserId",
+        "totalSecondsEstimate",
+        "pointsEstimate",
+        "groupingDate",
+        "dates",
+        "subTasks",
+        "labels",
+        "collaborators",
+        "timeline",
+        "customFields"
+      ],
+      "scope_fields": [],
+      "description": "Update a task: send only the fields to change (columnId moves it)"
+    },
+    {
+      "name": "task_delete",
+      "method": "DELETE",
+      "path_template": "/tasks/{task_id}",
+      "query_fields": [],
+      "body_fields": [],
+      "scope_fields": [],
+      "description": "Delete a task"
+    }
+  ]
+}

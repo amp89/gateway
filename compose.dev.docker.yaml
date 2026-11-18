@@ -1,0 +1,92 @@
+name: gateway-dev
+
+services:
+  # Docker has no podman :U volume option: start scripts run this once to chown the volume root.
+  volume-init:
+    image: docker.io/library/python:3.14-slim-trixie@sha256:89fb7d3da20043c370643435258bdd7ab755d326d359001d02988ed15ae5219e
+    profiles: ["setup"]
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    command: ["chown", "10001:10001", "/data", "/ui-modules"]
+    volumes:
+      - data:/data
+      - ui-modules:/ui-modules
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Containerfile.dev
+    image: localhost/gateway-dev:latest
+    container_name: gateway-dev
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/gateway
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ENV: development
+      API_PREFIX: api
+      ADMIN_PREFIX: admin
+      API_HOSTS: localhost,127.0.0.1
+      ADMIN_HOSTS: localhost,127.0.0.1
+      # Labelled dev-only passphrase: auto-unlocks on start. Refused when ENV=production.
+      DEV_AUTO_UNLOCK_PASSPHRASE: dev-only-passphrase-not-for-production
+      DATABASE_PATH: /data/gateway.sqlite3
+      # Host port of the dev API; only used to show the API URL in admin code samples.
+      GATEWAY_DEV_PORT: ${GATEWAY_DEV_PORT:-38081}
+    ports:
+      - "127.0.0.1:${GATEWAY_DEV_PORT:-38081}:8000"
+    volumes:
+      - ./app:/srv/app:ro,z
+      - ./packs:/srv/packs:ro,z
+      - data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -m app.healthcheck"]
+      interval: 10s
+      timeout: 4s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 10s
+
+  # Admin UI with hot reload at http://127.0.0.1:${GATEWAY_DEV_UI_PORT:-38082}/admin/ (API proxied to gateway).
+  ui:
+    image: docker.io/library/node:24.21.0-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe
+    container_name: gateway-dev-ui
+    user: "10001:10001"
+    working_dir: /ui
+    # npm ci only when node_modules (kept in the ui-modules volume) was installed from a different lockfile
+    command: ["sh", "-c", "cmp -s package-lock.json node_modules/.installed-lock || { npm ci --no-audit --no-fund --ignore-scripts && cp package-lock.json node_modules/.installed-lock; } && exec npx vite"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      VITE_API_PROXY_TARGET: http://gateway:8000
+      NODE_OPTIONS: --no-network-family-autoselection
+      NPM_CONFIG_CACHE: /tmp/npm-cache
+      NPM_CONFIG_UPDATE_NOTIFIER: "false"
+    ports:
+      - "127.0.0.1:${GATEWAY_DEV_UI_PORT:-38082}:38082"
+    volumes:
+      - ./ui/package.json:/ui/package.json:ro,z
+      - ./ui/package-lock.json:/ui/package-lock.json:ro,z
+      - ./ui/index.html:/ui/index.html:ro,z
+      - ./ui/vite.config.ts:/ui/vite.config.ts:ro,z
+      - ./ui/tsconfig.json:/ui/tsconfig.json:ro,z
+      - ./ui/src:/ui/src:ro,z
+      - ui-modules:/ui/node_modules
+    depends_on:
+      - gateway
+    stop_grace_period: 5s
+
+volumes:
+  data:
+    name: gateway-dev-data
+  ui-modules:
+    name: gateway-dev-ui-modules

@@ -1,0 +1,1 @@
+"""Single-tenant API gateway."""

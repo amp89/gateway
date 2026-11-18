@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+data/
+.venv*/
+__pycache__/
+ui/node_modules/
+ui/dist/
+ui-check/out/
+SPEC.md

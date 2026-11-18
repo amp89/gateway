@@ -1,0 +1,5 @@
+# UI check runner: Playwright's browser image (browsers + system deps) + the matching hash-locked Python package.
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble@sha256:35a390e70ab8ba7fbc909dc01af2329e287e89ccc8fb2f04a1a7ae94cacc5c30
+COPY requirements.lock /tmp/requirements.lock
+RUN PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 pip install --no-cache-dir --break-system-packages --require-hashes --no-deps --only-binary :all: -r /tmp/requirements.lock \
+    && rm /tmp/requirements.lock

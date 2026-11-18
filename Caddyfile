@@ -1,0 +1,21 @@
+# Prod front: plain HTTP inside the container on :8080, published only on 127.0.0.1 (see compose.yaml).
+# cloudflared and Tailscale on the host point here. TLS is theirs; Caddy has no certificates.
+# Only the two secret prefixes are proxied; everything else (including /health and /_unlock) is a bare 404.
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+:8080 {
+	@gateway path /{$API_PREFIX} /{$API_PREFIX}/* /{$ADMIN_PREFIX} /{$ADMIN_PREFIX}/*
+	handle @gateway {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy gateway:8000
+	}
+	handle {
+		respond 404
+	}
+}

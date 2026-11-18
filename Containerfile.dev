@@ -1,0 +1,9 @@
+# Gateway dev image: prod deps + pytest/pytest-xdist. Source is bind-mounted at /srv.
+FROM docker.io/library/python:3.14-slim-trixie@sha256:89fb7d3da20043c370643435258bdd7ab755d326d359001d02988ed15ae5219e
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
+RUN useradd --system --uid 10001 --no-create-home app
+WORKDIR /srv
+COPY requirements.lock requirements-dev.lock ./
+RUN pip install --require-hashes --no-deps --only-binary :all: -r requirements.lock -r requirements-dev.lock
+USER 10001:10001
+CMD ["uvicorn", "app.asgi:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--reload", "--reload-dir", "/srv/app", "--no-proxy-headers"]
