@@ -1,3 +1,5 @@
+# WORK IN PROGRESS - DO NOT USE THIS YET
+
 # API Gateway
 
 A self-hosted, single-tenant gateway that keeps bot and API tokens away from your scripts.
